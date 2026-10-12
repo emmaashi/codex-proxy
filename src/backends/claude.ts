@@ -107,18 +107,28 @@ export class ClaudeAccount {
   async verifyIdentity(signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if (!this.options.expectedEmail && !this.options.expectedOrg) return;
+    const started = Date.now();
     const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: 20000, signal});
     const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
+    // A cancelled turn kills the probe (SIGTERM, exit 143); that is the caller's abort, not an account problem.
+    signal?.throwIfAborted();
     let status: unknown;
     try { status = JSON.parse(output); } catch {}
     const info = isRecord(status) ? status : undefined;
-    if (exitCode !== 0 || !info?.loggedIn ||
-      (this.options.expectedEmail && info.email !== this.options.expectedEmail) ||
-      (this.options.expectedOrg && info.orgId !== this.options.expectedOrg)) {
-      // Content-free diagnostics: which condition failed, never the identity values themselves.
-      logSafe('claude-identity-mismatch', { exit: exitCode, logged_in: !!info?.loggedIn, email_match: !this.options.expectedEmail || info?.email === this.options.expectedEmail, org_match: !this.options.expectedOrg || info?.orgId === this.options.expectedOrg, aborted: !!signal?.aborted });
-      throw new BackendError('Claude account identity does not match its configured login');
-    }
+    const emailMatch = !this.options.expectedEmail || info?.email === this.options.expectedEmail;
+    const orgMatch = !this.options.expectedOrg || info?.orgId === this.options.expectedOrg;
+    if (exitCode === 0 && info?.loggedIn && emailMatch && orgMatch) return;
+    // Content-free diagnostics: which condition failed and how long the probe took, never the identity values.
+    const killed = child.signalCode !== null;
+    logSafe('claude-identity-check-failed', { exit: exitCode, killed, ms: Date.now() - started, parsed: !!info, logged_in: !!info?.loggedIn, email_match: emailMatch, org_match: orgMatch });
+    // Only a parsed, logged-in answer with the wrong email/org is an identity mismatch. A killed probe (the
+    // 20s spawn timeout under machine stall), a non-zero exit or unreadable output is a probe failure and
+    // must say so, or a transient stall reads as a login problem.
+    if (killed) throw new BackendError('Claude identity check was killed before it answered (claude auth status exceeded 20s); retry the turn');
+    if (exitCode !== 0) throw new BackendError(`Claude identity check failed (claude auth status exited ${exitCode}); retry the turn`);
+    if (!info) throw new BackendError('Claude identity check returned unreadable output; retry the turn');
+    if (!info.loggedIn) throw new BackendError('Claude account is not logged in for this configuration');
+    throw new BackendError('Claude account identity does not match its configured login');
   }
   run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
     return reconnectTransport(() => runClaudeOnce(request, signal, this), signal);

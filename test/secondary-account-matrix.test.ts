@@ -150,18 +150,20 @@ describe('secondary Claude account identity check', () => {
     const app = await fixtureRouter();
     try {
       const turnsBefore = await count('claude-turn');
-      const cases: Array<[string, number]> = [
-        [JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 0],
-        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_other' }), 0],
-        [JSON.stringify({ loggedIn: false }), 0],
-        ['not json', 0],
-        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 2],
+      // Each failure names its real cause: a mismatch is only reported for a parsed, logged-in answer with
+      // the wrong email/org. A dead probe or unreadable output must not read as a login problem.
+      const cases: Array<[string, number, string]> = [
+        [JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 0, 'identity does not match'],
+        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_other' }), 0, 'identity does not match'],
+        [JSON.stringify({ loggedIn: false }), 0, 'not logged in'],
+        ['not json', 0, 'unreadable output'],
+        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 2, 'auth status exited 2'],
       ];
-      for (const [identity, exit] of cases) {
+      for (const [identity, exit, expected] of cases) {
         await setIdentity(identity, exit);
         for (const model of [OPUS, FABLE]) {
           const seen = await everyTransport(app, body(model, 'x'));
-          expectTerminal(seen, 'invalid_request_error', 'identity does not match');
+          expectTerminal(seen, 'invalid_request_error', expected);
           for (const cell of seen) expect(cell.message).not.toContain('other@example.com');
         }
       }
