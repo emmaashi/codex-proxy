@@ -186,11 +186,16 @@ describe('Cursor bridge failures through the router', () => {
     } finally { await app.close(); }
   });
 
-  test('malformed model output is retried once and then refused', async () => {
+  test('malformed model output is retried once and then delivered as a chat message, not a failed turn', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('BAD_OUTPUT');
-      expectTerminal(await everyTransport(app, body('x')), 'no Codex actions were executed');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toContain('Cursor could not produce a valid action');
+        expect(cell.message, cell.transport).toContain('no Codex actions were executed');
+        if (cell.transport === 'http') expect(cell.status).toBe(200);
+      }
     } finally { await app.close(); }
   });
 

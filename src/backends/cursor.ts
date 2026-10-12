@@ -24,7 +24,7 @@ export type CursorOptions = {
   expectedEmail: string; expectedUserId: string; prefix: string; label: string; fastest?: boolean;
 };
 export class CursorError extends BackendError {
-  constructor(message: string, retryable = false) { super(message, { retryable }); this.name = 'CursorError'; }
+  constructor(message: string, retryable = false, modelOutput = false) { super(message, { retryable, modelOutput }); this.name = 'CursorError'; }
 }
 
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -209,7 +209,7 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}): never => {
     const captured = captureInvalidOutput(captureDir, category, text);
     logSafe('cursor-invalid-output', { category, bytes: text.length, captured: !!captured, ...fields });
-    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true);
+    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true, true);
   };
   const descriptors = toolDescriptors(request.tools ?? []);
   const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));

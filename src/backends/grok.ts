@@ -41,8 +41,8 @@ const BLOCKED_ENV = /^(XAI_API_KEY|GROK_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY
 
 /** A Grok refusal. Retryable only when nothing reached Codex; see `retryOnce`. */
 export class GrokError extends BackendError {
-  constructor(message: string, retryable = false) {
-    super(message, { retryable });
+  constructor(message: string, retryable = false, modelOutput = false) {
+    super(message, { retryable, modelOutput });
     this.name = 'GrokError';
   }
 }
@@ -161,7 +161,7 @@ export function functionArguments(raw: string): string {
       quotes: (raw.match(/"/g) ?? []).length,
       error: (error instanceof Error ? error.message : 'parse').replace(/[^A-Za-z ]+.*$/, '').slice(0, 60),
     });
-    throw new GrokError('Grok returned invalid tool arguments; no tools were executed', true);
+    throw new GrokError('Grok returned invalid tool arguments; no tools were executed', true, true);
   }
 
   let result: string | undefined;
@@ -174,7 +174,7 @@ export function functionArguments(raw: string): string {
       if (isRecord(JSON.parse(inner))) result = inner;
     } catch {}
   }
-  if (result === undefined) throw new GrokError('Grok tool arguments must be a JSON object; no tools were executed', true);
+  if (result === undefined) throw new GrokError('Grok tool arguments must be a JSON object; no tools were executed', true, true);
   if (result !== raw) logSafe('grok-arguments-repaired', { bytes: raw.length });
   return result;
 }
@@ -258,7 +258,7 @@ export function latestStepRecap(request: ResponsesRequest): string {
 function toolCallArguments(call: JsonRecord, descriptor: ToolDescriptor): string {
   const objectArgs = isRecord(call.arguments);
   if (typeof call.arguments !== 'string' && !(objectArgs && descriptor.type !== 'custom')) {
-    throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true);
+    throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
   }
   if (objectArgs) return checkArgumentShape(descriptor.proxyName, JSON.stringify(call.arguments), descriptor.contract);
   const raw = call.arguments as string;
@@ -272,7 +272,7 @@ export function parseGrokOutput(text: string, request: ResponsesRequest): ProxyO
   try {
     value = JSON.parse(text);
   } catch {
-    throw new GrokError('Grok returned invalid structured output; no tools were executed', true);
+    throw new GrokError('Grok returned invalid structured output; no tools were executed', true, true);
   }
   if (
     !isRecord(value) ||
@@ -281,14 +281,14 @@ export function parseGrokOutput(text: string, request: ResponsesRequest): ProxyO
     value.tool_calls.length > MAX_TOOL_CALLS ||
     Object.keys(value).some((key) => key !== 'text' && key !== 'tool_calls')
   ) {
-    throw new GrokError('Grok returned invalid structured output; no tools were executed', true);
+    throw new GrokError('Grok returned invalid structured output; no tools were executed', true, true);
   }
 
   const allowed = new Map(toolDescriptors(request.tools ?? []).map((tool) => [tool.proxyName, tool]));
   const toolCalls: ToolCall[] = value.tool_calls.map((call: unknown) => {
     const descriptor = isRecord(call) && typeof call.name === 'string' ? allowed.get(call.name) : undefined;
     if (!isRecord(call) || !descriptor) {
-      throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true);
+      throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
     }
     return { name: descriptor.proxyName, arguments: toolCallArguments(call, descriptor), callId: randomId('call') };
   });

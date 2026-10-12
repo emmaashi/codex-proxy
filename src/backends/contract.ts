@@ -36,6 +36,12 @@ export type FailureOptions = {
   logEvent?: Record<string, unknown>;
   /** True only when the backend refused before anything reached Codex, so one more attempt is safe. */
   retryable?: boolean;
+  /**
+   * True when the refusal is about what the model wrote (unparseable reply, bad tool arguments, unknown
+   * tool). After the one retry, such a refusal is delivered as a chat message instead of a failed turn.
+   * Process crashes, transport failures and native-tool attempts must leave this false.
+   */
+  modelOutput?: boolean;
 };
 
 /**
@@ -46,6 +52,7 @@ export class BackendError extends Error {
   readonly code: string;
   readonly logEvent?: Record<string, unknown>;
   readonly retryable: boolean;
+  readonly modelOutput: boolean;
 
   constructor(message: string, options: FailureOptions = {}) {
     super(message);
@@ -53,6 +60,7 @@ export class BackendError extends Error {
     this.code = options.code ?? 'invalid_request_error';
     this.logEvent = options.logEvent;
     this.retryable = options.retryable ?? false;
+    this.modelOutput = options.modelOutput ?? false;
   }
 }
 
@@ -62,21 +70,38 @@ export const RETRY_MARKER = 'rejected before anything ran';
  * The one retry policy every backend shares. A retryable refusal means nothing reached Codex, so a
  * second attempt is safe and is told why the first was rejected. Cancellation, timeouts, auth and
  * quota failures are never retryable and surface immediately.
+ *
+ * When the retry is also refused and the refusal is about the model's own output (`modelOutput`),
+ * the turn is not failed. The refusal is delivered as an ordinary assistant message: Codex keeps the
+ * turn open, the user sees what went wrong in the chat, and can reply naturally instead of hitting an
+ * error card and typing "continue". No tool call is emitted. Crashes and transport failures still fail.
  */
-export async function retryOnce<T>(
+export async function retryOnce(
   backend: string,
   signal: AbortSignal | undefined,
-  attempt: (retryNote: string) => Promise<T>,
-): Promise<T> {
+  attempt: (retryNote: string) => Promise<ProxyOutput>,
+): Promise<ProxyOutput> {
   try {
     return await attempt('');
   } catch (error) {
     if (!(error instanceof BackendError) || !error.retryable || signal?.aborted) throw error;
     logSafe('backend-retry', { backend, reason: error.message });
-    return attempt(
-      ` Your previous answer was ${RETRY_MARKER}: ${error.message}. Follow the output rules exactly this time.`,
-    );
+    try {
+      return await attempt(
+        ` Your previous answer was ${RETRY_MARKER}: ${error.message}. Follow the output rules exactly this time.`,
+      );
+    } catch (second) {
+      if (!(second instanceof BackendError) || !second.retryable || !second.modelOutput || signal?.aborted) throw second;
+      logSafe('backend-refusal-as-message', { backend, reason: second.message });
+      return refusalMessage(backend, second);
+    }
   }
+}
+
+/** A text-only output that explains a refusal in the chat instead of failing the turn. */
+export function refusalMessage(backend: string, error: BackendError): ProxyOutput {
+  const text = `${backend} could not produce a valid action for this turn, even after one retry: ${error.message}. Nothing was executed. Reply to continue, or rephrase the request.`;
+  return { text, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
 }
 
 export type CliFailure =

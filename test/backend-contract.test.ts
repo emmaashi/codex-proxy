@@ -18,13 +18,20 @@ const EVERY_MODEL=[GPT,...LOCAL.map(entry=>entry.model)];
 
 // Shared failure policy every backend inherits through retryOnce, logSafe and classifyCliFailure.
 describe('shared failure policy',()=>{
-  test('a retryable refusal is retried exactly once and the second attempt is told why',async()=>{
+  test('a retryable refusal is retried exactly once; a second refusal becomes a chat message, not a failed turn',async()=>{
     const notes:string[]=[];
-    const result=await retryOnce('fixture',undefined,async note=>{notes.push(note);if(notes.length===1)throw new BackendError('bad arguments',{retryable:true});return 'ok';});
-    expect(result).toBe('ok');expect(notes).toHaveLength(2);expect(notes[0]).toBe('');
+    const ok={text:'ok',toolCalls:[],usage:{inputTokens:0,outputTokens:0,totalTokens:0}};
+    const result=await retryOnce('fixture',undefined,async note=>{notes.push(note);if(notes.length===1)throw new BackendError('bad arguments',{retryable:true});return ok;});
+    expect(result).toBe(ok);expect(notes).toHaveLength(2);expect(notes[0]).toBe('');
     expect(notes[1]).toContain(RETRY_MARKER);expect(notes[1]).toContain('bad arguments');
     let calls=0;
-    await expect(retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('still bad',{retryable:true});})).rejects.toThrow('still bad');
+    const softened=await retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('still bad',{retryable:true,modelOutput:true});});
+    expect(calls).toBe(2);
+    expect(softened.toolCalls).toEqual([]);
+    expect(softened.text).toContain('fixture');expect(softened.text).toContain('still bad');expect(softened.text).toContain('Nothing was executed');
+    // A retryable failure that is not about the model's output (crash, transport) still fails the turn.
+    calls=0;
+    await expect(retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('process crashed',{retryable:true});})).rejects.toThrow('process crashed');
     expect(calls).toBe(2);
   });
   test('refusals, foreign errors and cancelled requests are never retried',async()=>{
