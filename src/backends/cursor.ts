@@ -131,6 +131,26 @@ export function parseJsonLenient(raw: string): unknown {
   throw new Error('no lenient JSON parse');
 }
 function parseJsonLoosely(raw: string): unknown {
+  return parseJsonLooselyImpl(raw);
+}
+
+/**
+ * Custom tools take one raw string. Models (Kimi especially) often wrap it as {"code": "..."},
+ * {"input": "..."} or {"patch": "..."}; unwrap a single-string-field object rather than refusing
+ * the turn. Returns undefined when no single string can be recovered.
+ */
+export function coerceCustomArguments(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  if (!isRecord(value)) return undefined;
+  const keys = Object.keys(value);
+  for (const key of ['input', 'code', 'source', 'patch', 'script', 'text', 'content', 'arguments', 'raw']) if (typeof value[key] === 'string') return value[key] as string;
+  const strings = keys.filter(key => typeof value[key] === 'string');
+  if (keys.length === 1 && strings.length === 1) return value[strings[0]!] as string;
+  return undefined;
+}
+
+function parseJsonLooselyImpl(raw: string): unknown {
   try { return JSON.parse(raw); } catch { /* fall through */ }
   try { return JSON.parse(repairJsonStrings(raw)); } catch { /* fall through */ }
   const value = parseJsonLenient(raw);
@@ -227,8 +247,10 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     }
     const rawArgs = inner.arguments ?? inner.input ?? inner.parameters;
     if (descriptor.type === 'custom') {
-      if (typeof rawArgs !== 'string') return refuse(`passed non-string arguments to custom tool ${descriptor.proxyName}; its arguments must be one raw string, not a JSON object`, 'custom-args-type', { tool: descriptor.proxyName });
-      return { name: descriptor.proxyName, arguments: rawArgs, callId: randomId('call') };
+      const raw = coerceCustomArguments(rawArgs);
+      if (raw === undefined) return refuse(`passed non-string arguments to custom tool ${descriptor.proxyName}; its arguments must be one raw string, not a JSON object`, 'custom-args-type', { tool: descriptor.proxyName });
+      if (raw !== rawArgs) logSafe('cursor-custom-args-unwrapped', { tool: descriptor.proxyName });
+      return { name: descriptor.proxyName, arguments: raw, callId: randomId('call') };
     }
     let args: unknown = rawArgs;
     if (args === undefined || args === null || args === '') args = {};

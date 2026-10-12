@@ -1,5 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { connectFrames, cursorEnvironment, cursorSelection, interpretCursorEvents, parseCursorOutput, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
+import { connectFrames, cursorEnvironment, cursorSelection, interpretCursorEvents, parseCursorOutput, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, coerceCustomArguments, CursorError } from '../src/backends/cursor';
+
+test('Cursor unwraps object-wrapped custom tool arguments instead of refusing the turn',()=>{
+ expect(coerceCustomArguments('raw')).toBe('raw');
+ expect(coerceCustomArguments({code:'await tools.exec_command({cmd:"ls"})'})).toBe('await tools.exec_command({cmd:"ls"})');
+ expect(coerceCustomArguments({input:'*** Begin Patch'})).toBe('*** Begin Patch');
+ expect(coerceCustomArguments({whatever:'x'})).toBe('x');
+ expect(coerceCustomArguments({a:'x',b:'y'})).toBeUndefined();
+ expect(coerceCustomArguments({cmd:1})).toBeUndefined();
+ expect(coerceCustomArguments(undefined)).toBe('');
+ const req={model:'kimi-k3',input:'t',tools:[{type:'custom',name:'exec'}]} as const;
+ const out=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{name:'exec',arguments:{code:'text(1)'}}]}),req as never);
+ expect(out.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['exec','text(1)']]);
+});
 
 test('Cursor sanitizer drops encrypted reasoning and compaction items and replaces media parts instead of refusing the turn',()=>{
  type R=Record<string,unknown>;
