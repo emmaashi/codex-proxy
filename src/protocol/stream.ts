@@ -36,7 +36,8 @@ export async function decodeBody(req: Request): Promise<JsonRecord> {
   else if (encoding && encoding !== 'identity') throw new Error('Unsupported request encoding');
   if (bytes.length > MAX_BODY_BYTES) throw new Error('Request too large');
 
-  const body: unknown = JSON.parse(bytes.toString());
+  let body: unknown;
+  try { body = JSON.parse(bytes.toString()); } catch { throw new Error('Request body is not valid JSON'); }
   if (!isRecord(body)) throw new Error('Request body must be a JSON object');
   return body;
 }

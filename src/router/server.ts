@@ -46,7 +46,9 @@ const PASSTHROUGH_PATHS = new Set(['/v1/alpha/search', '/v1/images/generations',
 const BRIDGE_TIMEOUT_MS = 300_000;
 
 /** Error messages written by the router itself, safe to show the user verbatim. */
-const HTTP_VISIBLE = /^(Request too large|Unsupported|Previous|Missing request|OpenAI-encrypted history|OpenAI compaction|Compaction produced)/;
+const HTTP_VISIBLE = /^(Request too large|Request body|Unsupported|Previous|Missing request|OpenAI-encrypted history|OpenAI compaction|Compaction produced)/;
+// Faults in the request itself are 400 (never retried); faults bridging to OpenAI stay 502 so Codex retries.
+const CLIENT_FAULT = /^(Request |Missing request|Unsupported)/;
 const WS_VISIBLE = /^(OpenAI-encrypted history|OpenAI compaction|Compaction produced|Unsupported|Previous)/;
 const WS_LOGGED = /^(Unsupported|Previous|OpenAI-encrypted history|OpenAI compaction|Compaction produced|model is required|Request|tools must)/;
 const GENERIC_FAILURE = 'Model request failed; retry or check subscription access';
@@ -242,7 +244,7 @@ export function startRouter(options: RouterOptions) {
         hint: error instanceof Error ? error.message.slice(0, 60) : '',
       });
       const visible = errorPrefix(error, HTTP_VISIBLE);
-      if (visible) return invalidRequest(visible, 502);
+      if (visible) return invalidRequest(visible, CLIENT_FAULT.test(visible) ? 400 : 502);
       return streaming
         ? failureStream({ type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { code: 'server_error', message: INTERNAL_FAILURE } } })
         : Response.json({ error: { type: 'server_error', code: 'server_error', message: INTERNAL_FAILURE } }, { status: 500 });
