@@ -54,6 +54,32 @@ remains separate from connection timeouts. GPT stream failures continue through 
 reconnect path; this change applies to buffered Claude requests. Reload a running proxy after
 updating its source.
 
+## Retries and errors versus native Codex
+
+The router mirrors the native Codex client's retry and error policy wherever a request passes
+through to ChatGPT, and adapts it where a subscription CLI is the model. Native source of truth:
+`codex-rs/model-provider-info` (4 request retries, 200 ms doubling backoff, 5xx and transport
+retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames skipped,
+`response.failed` codes classified) and `codex-rs/protocol/src/error.rs` (which errors retry).
+
+| Situation | Native Codex | This router |
+| --- | --- | --- |
+| OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); covers turns, compaction and bridge calls |
+| Dropped socket to OpenAI | retried 4x | same; timeouts are not retried (Codex owns that budget) |
+| OpenAI 4xx incl. 429 | not retried, status surfaced | relayed once with the real status and body |
+| Lasting 5xx | surfaced with real status | surfaced with real status as `server_error`, never masked as 400 |
+| Unparseable SSE frame | skipped, stream continues | skipped (`sse-frame-skipped` log) |
+| Stream ends without terminal event | retryable stream error | WebSocket: retryable `server_error`; HTTP: raw relay so Codex detects it |
+| Upstream `response.failed` | classified by code | forwarded verbatim so Codex classifies it |
+| Internal router/backend crash | retryable | `server_error` 500 on every transport; diagnostic never leaked |
+| Malformed request body / unknown model | 400, not retried | 400, not retried |
+| Subscription CLI refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
+| Subscription CLI network drop | n/a | pending with 1–30 s backoff and progress events; see Connection recovery |
+
+`test/failure-matrix.test.ts` exercises every registered model row (GPT relay, personal and
+secondary Claude, Cursor, Grok, the Opus quota fallback) against each row above on plain HTTP,
+streaming HTTP and WebSocket.
+
 ## Optional second Codex account
 
 Add an isolated native Codex login alongside the primary account. The router
