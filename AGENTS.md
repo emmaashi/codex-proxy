@@ -21,3 +21,6 @@ Rules:
 - Never log prompt or response content; use `logSafe` with counts and sizes.
 - A new backend implements `SubscriptionBackend` and is added to `BACKENDS` in `registry.ts`.
 - CI is manual (`workflow_dispatch`) to save Actions minutes.
+- The router loads source only at startup. If a local service (launchd, systemd, etc.) runs from
+  this checkout, a passing edit is not live until that service is restarted; the operator's deploy
+  procedure lives outside this repo. Do not keep a second copy of `src/` anywhere else.
