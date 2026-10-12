@@ -20,7 +20,7 @@ import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, restor
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse } from './local';
-import { jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamFetch, upstreamErrorDetail, upstreamHeaders } from './upstream';
+import { jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamFetch, upstreamErrorDetail, upstreamHeaders, UpstreamStatusError } from './upstream';
 
 export type RouterOptions = {
   port: number;
@@ -58,6 +58,12 @@ const isCompaction = (body: ResponsesBody) =>
 
 function invalidRequest(message: string, status = 400): Response {
   return Response.json({ error: { type: 'invalid_request_error', message } }, { status });
+}
+
+/** The error body for an upstream failure, typed so Codex retries 5xx and not 4xx. */
+function upstreamFailureBody(error: UpstreamStatusError) {
+  const type = error.status >= 500 ? 'server_error' : 'invalid_request_error';
+  return { type, code: type, message: error.message };
 }
 
 function errorPrefix(error: unknown, pattern: RegExp): string | undefined {
@@ -155,7 +161,7 @@ export function startRouter(options: RouterOptions) {
       if (!upstream.ok) {
         const detail = await upstreamErrorDetail(upstream);
         log.warn('compact-upstream', { status: upstream.status, detail });
-        throw new Error(`OpenAI compaction request failed HTTP ${upstream.status}${detail ? `: ${detail}` : ''}`);
+        throw new UpstreamStatusError(`OpenAI compaction request failed HTTP ${upstream.status}${detail ? `: ${detail}` : ''}`, upstream.status);
       }
       await sseEvents(upstream, (event) => {
         if (event.type === 'response.output_item.done' && isRecord(event.item)) streamedItems.push(event.item as OutputItem);
@@ -217,6 +223,7 @@ export function startRouter(options: RouterOptions) {
           : Response.json({ error: { type: 'invalid_request_error', code: error.code, message: error.message } }, { status: 400 });
       }
       if (error instanceof HistoryMiss) return invalidRequest(error.message);
+      if (error instanceof UpstreamStatusError) return Response.json({ error: upstreamFailureBody(error) }, { status: error.status });
       logSafe('http-failed', {
         path,
         compaction: path.includes('compact'),
@@ -288,6 +295,9 @@ export function startRouter(options: RouterOptions) {
         // Dropping the socket makes Codex reconnect and resend the full history.
         log.warn('history-miss');
         ws.close(1011, 'history unavailable');
+      } else if (error instanceof UpstreamStatusError) {
+        log.warn('failed', { cancelled: !live(), category: error.message });
+        if (live()) send({ type: 'error', status: error.status, error: upstreamFailureBody(error) });
       } else {
         log.warn('failed', { cancelled: !live(), category: errorPrefix(error, WS_LOGGED) ?? 'upstream-or-transport' });
         if (live()) {

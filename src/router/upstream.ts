@@ -1,9 +1,21 @@
 // Talking to the ChatGPT Codex backend on the user's behalf, with the user's own credentials.
+import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
 export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * An upstream HTTP failure that keeps OpenAI's status, so Codex applies its own retry policy:
+ * 5xx is retryable, 4xx is not. Reporting every failure as 400 would suppress that retry.
+ */
+export class UpstreamStatusError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'UpstreamStatusError';
+  }
+}
 
 /** Hop-by-hop and browser headers that must never be forwarded. */
 const STRIPPED = /^(host|connection|upgrade|sec-websocket(?:-.*)?|content-length|origin)$/i;
@@ -53,18 +65,26 @@ export async function upstreamErrorDetail(response: Response): Promise<string> {
   }
 }
 
-export function postJson(
+/**
+ * Native Codex retries 5xx responses 4 times with a 200ms doubling backoff. Matching it means a
+ * transient 5xx (such as 507) never surfaces as a failed turn or compaction. The body is a string,
+ * so resending it is safe, and nothing has reached Codex before the status is known.
+ */
+export async function postJson(
   upstreamFetch: UpstreamFetch,
   path: string,
   headers: Headers,
   body: ResponsesBody,
   signal: AbortSignal,
 ): Promise<Response> {
-  return upstreamFetch(UPSTREAM_URL + path, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-    redirect: 'error',
-  });
+  const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(body), signal, redirect: 'error' };
+  const retries = Number(process.env.UPSTREAM_5XX_RETRIES ?? 4);
+  const baseDelayMs = Number(process.env.UPSTREAM_RETRY_BASE_MS ?? 200);
+  for (let attempt = 0; ; attempt++) {
+    const response = await upstreamFetch(UPSTREAM_URL + path, init);
+    if (response.status < 500 || attempt >= retries || signal.aborted) return response;
+    logSafe('upstream-retry', { path, status: response.status, attempt: attempt + 1 });
+    await response.body?.cancel().catch(() => {});
+    await Bun.sleep(baseDelayMs * 2 ** attempt);
+  }
 }
