@@ -29,6 +29,8 @@ test('upstream EOF without a terminal event reports a dropped connection instead
 });
 
 test('HTTP and WebSocket disconnect errors remain retryable and a later request completes with the original history', async () => {
+  // The router now retries transport throws (4x, native policy) before reporting; keep the backoff tiny here.
+  process.env.UPSTREAM_RETRY_BASE_MS='1';
   const dir=await mkdtemp(tmpdir()+'/proxy-transport-');
   await Bun.write(dir+'/auth.json',JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:'test-token',account_id:'test-account'}}));
   await Bun.write(dir+'/catalog.json','{}');

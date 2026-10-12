@@ -1,6 +1,7 @@
 // Talking to the ChatGPT Codex backend on the user's behalf, with the user's own credentials.
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
+import { transportError } from '../transport';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
@@ -66,9 +67,10 @@ export async function upstreamErrorDetail(response: Response): Promise<string> {
 }
 
 /**
- * Native Codex retries 5xx responses 4 times with a 200ms doubling backoff. Matching it means a
- * transient 5xx (such as 507) never surfaces as a failed turn or compaction. The body is a string,
- * so resending it is safe, and nothing has reached Codex before the status is known.
+ * Native Codex retries 5xx responses and dropped connections 4 times with a 200ms doubling backoff
+ * (429 is never retried at this layer). Matching it means a transient 5xx (such as 507) or a reset
+ * socket never surfaces as a failed turn or compaction. The body is a string, so resending it is
+ * safe, and nothing has reached Codex before the status is known.
  */
 export async function postJson(
   upstreamFetch: UpstreamFetch,
@@ -81,7 +83,15 @@ export async function postJson(
   const retries = Number(process.env.UPSTREAM_5XX_RETRIES ?? 4);
   const baseDelayMs = Number(process.env.UPSTREAM_RETRY_BASE_MS ?? 200);
   for (let attempt = 0; ; attempt++) {
-    const response = await upstreamFetch(UPSTREAM_URL + path, init);
+    let response: Response;
+    try { response = await upstreamFetch(UPSTREAM_URL + path, init); }
+    catch (error) {
+      const network = transportError(error);
+      if (!network || network.timedOut || attempt >= retries || signal.aborted) throw error;
+      logSafe('upstream-retry', { path, status: 0, attempt: attempt + 1 });
+      await Bun.sleep(baseDelayMs * 2 ** attempt);
+      continue;
+    }
     if (response.status < 500 || attempt >= retries || signal.aborted) return response;
     logSafe('upstream-retry', { path, status: response.status, attempt: attempt + 1 });
     await response.body?.cancel().catch(() => {});

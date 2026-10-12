@@ -50,6 +50,8 @@ const HTTP_VISIBLE = /^(Request too large|Unsupported|Previous|Missing request|O
 const WS_VISIBLE = /^(OpenAI-encrypted history|OpenAI compaction|Compaction produced|Unsupported|Previous)/;
 const WS_LOGGED = /^(Unsupported|Previous|OpenAI-encrypted history|OpenAI compaction|Compaction produced|model is required|Request|tools must)/;
 const GENERIC_FAILURE = 'Model request failed; retry or check subscription access';
+/** Native Codex treats its own internal errors as retryable; so does the router (a 500 is retried, a 400 is not). */
+const INTERNAL_FAILURE = 'Internal router error; Codex will retry.';
 
 type SocketData = { headers: Headers; busy: boolean; abort?: AbortController };
 
@@ -59,6 +61,10 @@ const isCompaction = (body: ResponsesBody) =>
 function invalidRequest(message: string, status = 400): Response {
   return Response.json({ error: { type: 'invalid_request_error', message } }, { status });
 }
+
+// Subscription quota refusals deliberately stay terminal `invalid_prompt` failures with our own message
+// rather than a ChatGPT-shaped 429 `usage_limit_reached`: native Codex discards the body message for
+// that shape and renders its generic ChatGPT usage-limit copy, which would hide which model is capped.
 
 /** The error body for an upstream failure, typed so Codex retries 5xx and not 4xx. */
 function upstreamFailureBody(error: UpstreamStatusError) {
@@ -186,7 +192,11 @@ export function startRouter(options: RouterOptions) {
 
   const pendingFailure = (error: unknown): Record<string, unknown> => {
     const network = transportError(error);
-    return network ? transportFailureEvent(network) : terminalEvent(error instanceof BackendError ? error : new BackendError(GENERIC_FAILURE));
+    if (network) return transportFailureEvent(network);
+    if (error instanceof BackendError) return terminalEvent(error);
+    // An unexpected router/backend exception mid-stream: retryable, like native Codex's own internal errors.
+    logSafe('pending-internal-error', { name: error instanceof Error ? error.name : typeof error });
+    return { type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { code: 'server_error', message: INTERNAL_FAILURE } } };
   };
 
   async function handleHttp(req: Request, path: string): Promise<Response> {
@@ -231,7 +241,11 @@ export function startRouter(options: RouterOptions) {
         name: error instanceof Error ? error.name : typeof error,
         hint: error instanceof Error ? error.message.slice(0, 60) : '',
       });
-      return invalidRequest(errorPrefix(error, HTTP_VISIBLE) ?? GENERIC_FAILURE, 502);
+      const visible = errorPrefix(error, HTTP_VISIBLE);
+      if (visible) return invalidRequest(visible, 502);
+      return streaming
+        ? failureStream({ type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { code: 'server_error', message: INTERNAL_FAILURE } } })
+        : Response.json({ error: { type: 'server_error', code: 'server_error', message: INTERNAL_FAILURE } }, { status: 500 });
     }
   }
 
@@ -299,14 +313,13 @@ export function startRouter(options: RouterOptions) {
         log.warn('failed', { cancelled: !live(), category: error.message });
         if (live()) send({ type: 'error', status: error.status, error: upstreamFailureBody(error) });
       } else {
-        log.warn('failed', { cancelled: !live(), category: errorPrefix(error, WS_LOGGED) ?? 'upstream-or-transport' });
-        if (live()) {
-          send({
-            type: 'error',
-            status: 400,
-            error: { type: 'invalid_request_error', code: 'invalid_request_error', message: errorPrefix(error, WS_VISIBLE) ?? GENERIC_FAILURE },
-          });
-        }
+        const visible = errorPrefix(error, WS_VISIBLE);
+        log.warn('failed', { cancelled: !live(), category: errorPrefix(error, WS_LOGGED) ?? 'internal', name: error instanceof Error ? error.name : typeof error });
+        if (!live()) return;
+        // Router-visible refusals are terminal (400). Anything else is an internal fault: 500 so Codex retries.
+        send(visible
+          ? { type: 'error', status: 400, error: { type: 'invalid_request_error', code: 'invalid_request_error', message: visible } }
+          : { type: 'error', status: 500, error: { type: 'server_error', code: 'server_error', message: INTERNAL_FAILURE } });
       }
     } finally {
       log.info('request-finished', { cancelled: !live() });

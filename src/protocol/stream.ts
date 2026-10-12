@@ -1,4 +1,5 @@
 import { isRecord, type JsonRecord } from '../json';
+import { logSafe } from '../log';
 import { ProxyTransportError } from '../transport';
 import type { StreamEvent } from './types';
 
@@ -58,7 +59,11 @@ export async function sseEvents(response: Response, consume: (event: StreamEvent
       .join('\n');
     if (!data) return false;
     if (data === '[DONE]') return true;
-    const event = JSON.parse(data) as StreamEvent;
+    let event: StreamEvent;
+    // Native Codex skips a frame it cannot parse and keeps reading; one bad frame must not fail the turn.
+    try { event = JSON.parse(data) as StreamEvent; }
+    catch { logSafe('sse-frame-skipped', { bytes: data.length }); return false; }
+    if (!isRecord(event)) { logSafe('sse-frame-skipped', { bytes: data.length }); return false; }
     consume(event);
     return TERMINAL_EVENTS.has(event.type);
   };
