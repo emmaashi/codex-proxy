@@ -15,10 +15,16 @@ for(const invalid of [
  {text:'',tool_calls:[{name:'shell',arguments:{}}]},
  {text:'',tool_calls:[{name:'functions.read',arguments:{path:1}}]},
  {text:'',tool_calls:[{name:'functions.read',arguments:{}}]},
- {text:'',tool_calls:[{name:'functions.read',arguments:{path:'a',extra:true}}]},
  {text:'',tool_calls:[{name:'apply_patch',arguments:{patch:'x'}}]},
- {text:'',tool_calls:[],extra:true},
 ])test('Cursor refuses malformed or unavailable action '+JSON.stringify(invalid),()=>{expect(()=>output(invalid)).toThrow(CursorError)});
+test('Cursor lenient parser tolerates fences, extra keys, extra args and OpenAI-style calls',()=>{
+ const fenced='Here is my answer:\n```json\n{"text":"hi","tool_calls":[{"name":"functions.read","arguments":"{\\"path\\":\\"a\\"}"}]}\n```';
+ expect(parseCursorOutput(fenced,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['functions.read','{"path":"a"}']]);
+ expect(output({text:'',tool_calls:[{name:'functions.read',arguments:{path:'a',extra:true}}]}).toolCalls[0]!.arguments).toBe('{"path":"a"}');
+ expect(output({text:'',tool_calls:[],extra:true}).toolCalls).toEqual([]);
+ expect(output({text:'',tool_calls:[{type:'function',function:{name:'functions.read',arguments:{path:'a'}}}]}).toolCalls[0]!.name).toBe('functions.read');
+ expect(()=>parseCursorOutput('this is not the JSON object',request)).toThrow(/no Codex actions were executed/);
+});
 test('Cursor does not classify assistant quota text as a failure',()=>expect(output({text:'quota 429 expired',tool_calls:[]}).text).toBe('quota 429 expired'));
 test('Cursor model parameters are family specific and unsupported effort is refused',()=>{
  expect(cursorSelection('kimi-k3','max').params).toEqual([{id:'reasoning',value:'max'}]);

@@ -190,7 +190,7 @@ describe('Cursor bridge failures through the router', () => {
     const app = await fixtureRouter();
     try {
       await scenario('BAD_OUTPUT');
-      expectTerminal(await everyTransport(app, body('x')), 'invalid structured output');
+      expectTerminal(await everyTransport(app, body('x')), 'no Codex actions were executed');
     } finally { await app.close(); }
   });
 

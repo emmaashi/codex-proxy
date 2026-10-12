@@ -2,14 +2,16 @@
 // package dependency: it speaks sdk.v1 Connect JSON to a short-lived loopback child process.
 // Every request starts with tools: [], no setting sources, no MCP and no subagents. Cursor never
 // owns execution; validated tool requests return to Codex only after the complete run succeeds.
-import { readFileSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { BackendError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { repairJsonStrings } from './grok';
+import { logSafe } from '../log';
 
 export const CURSOR_MODELS = {
   'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '' },
@@ -65,28 +67,195 @@ function matchesSchema(value: unknown, schema: unknown, depth = 0): boolean {
   return true;
 }
 
-export function parseCursorOutput(text: string, request: ResponsesRequest): ProxyOutput {
-  const refuse = (): never => { throw new CursorError('Cursor returned invalid structured output or tool arguments; no Codex actions were executed', true); };
-  let value: unknown;
-  try { value = JSON.parse(text); } catch { return refuse(); }
-  if (!isRecord(value) || typeof value.text !== 'string' || !Array.isArray(value.tool_calls) || value.tool_calls.length > 64 || Object.keys(value).some(key => !['text', 'tool_calls'].includes(key))) return refuse();
-  const allowed = new Map(toolDescriptors(request.tools ?? []).map(tool => [tool.proxyName, tool]));
-  const toolCalls = value.tool_calls.map((call: unknown) => {
-    if (!isRecord(call) || typeof call.name !== 'string' || Object.keys(call).some(key => !['name', 'arguments'].includes(key))) return refuse();
-    const descriptor = allowed.get(call.name);
-    if (!descriptor) return refuse();
-    if (descriptor.type === 'custom') {
-      if (typeof call.arguments !== 'string') return refuse();
-      return { name: descriptor.proxyName, arguments: call.arguments, callId: randomId('call') };
+// Models wrap the JSON object in a Markdown fence or add prose around it; pull out the outermost
+// object before parsing. Text inside the object is untouched, so a broken structure still fails.
+function extractJsonObject(text: string): string {
+  let s = text.trim();
+  const fence = s.match(/^```[a-zA-Z]*\s*([\s\S]*?)\s*```$/);
+  if (fence) s = fence[1]!.trim();
+  if (s.startsWith('{') && s.endsWith('}')) return s;
+  const start = s.indexOf('{'), end = s.lastIndexOf('}');
+  return start >= 0 && end > start ? s.slice(start, end + 1) : s;
+}
+// Code inside a JSON string (shell commands, JavaScript for cua_repl) often arrives with its inner
+// double quotes unescaped. No local rule can tell `"a" }` inside code from a real string end, so this
+// backtracks: each unescaped quote is tried as the terminator, nearest first, and the first choice
+// under which the whole document parses wins. Valid JSON therefore parses exactly as JSON.parse would.
+// Only used after strict and control-character repair fail; a work budget bounds pathological input.
+export function parseJsonLenient(raw: string): unknown {
+  let budget = 50_000;
+  const spend = () => { if (--budget < 0) throw new Error('lenient JSON parse budget exhausted'); };
+  const ws = (i: number) => { while (i < raw.length && /\s/.test(raw[i]!)) i++; return i; };
+  function* str(i: number): Generator<[string, number]> {
+    let j = i + 1, body = '';
+    while (j < raw.length) {
+      const c = raw[j]!;
+      if (c === '\\') { body += c + (raw[j + 1] ?? ''); j += 2; continue; }
+      if (c === '"') {
+        spend();
+        let parsed: string | undefined;
+        try { parsed = JSON.parse(repairJsonStrings('"' + body + '"')); } catch { /* not a usable terminator */ }
+        if (typeof parsed === 'string') yield [parsed, j + 1];
+        body += '\\"'; j++; continue;
+      }
+      body += c; j++;
     }
-    let args: unknown = call.arguments;
-    if (typeof args === 'string') { try { args = JSON.parse(args); } catch { return refuse(); } }
-    if (!isRecord(args) || !matchesSchema(args, descriptor.contract)) return refuse();
+  }
+  function* members(i: number, acc: JsonRecord): Generator<[JsonRecord, number]> {
+    i = ws(i); if (raw[i] !== '"') return;
+    for (const [key, afterKey] of str(i)) {
+      const colon = ws(afterKey); if (raw[colon] !== ':') continue;
+      for (const [val, afterVal] of value(colon + 1)) {
+        const next = { ...acc, [key]: val }, p = ws(afterVal);
+        if (raw[p] === '}') yield [next, p + 1];
+        else if (raw[p] === ',') yield* members(p + 1, next);
+      }
+    }
+  }
+  function* items(i: number, acc: unknown[]): Generator<[unknown[], number]> {
+    for (const [val, afterVal] of value(i)) {
+      const next = [...acc, val], p = ws(afterVal);
+      if (raw[p] === ']') yield [next, p + 1];
+      else if (raw[p] === ',') yield* items(p + 1, next);
+    }
+  }
+  function* value(i: number): Generator<[unknown, number]> {
+    spend();
+    i = ws(i); const ch = raw[i];
+    if (ch === '"') yield* str(i);
+    else if (ch === '{') { const j = ws(i + 1); if (raw[j] === '}') yield [{}, j + 1]; else yield* members(j, {}); }
+    else if (ch === '[') { const j = ws(i + 1); if (raw[j] === ']') yield [[], j + 1]; else yield* items(j, []); }
+    else { const m = /^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(raw.slice(i, i + 64)); if (m) yield [JSON.parse(m[0]), i + m[0].length]; }
+  }
+  for (const [parsed, end] of value(0)) if (ws(end) === raw.length) return parsed;
+  throw new Error('no lenient JSON parse');
+}
+function parseJsonLoosely(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { /* fall through */ }
+  try { return JSON.parse(repairJsonStrings(raw)); } catch { /* fall through */ }
+  const value = parseJsonLenient(raw);
+  logSafe('cursor-output-repaired', { category: 'lenient', bytes: raw.length });
+  return value;
+}
+const fieldName = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(key) ? key : '(invalid name)';
+
+// Kimi K3 under long tool-heavy contexts abandons the JSON contract and emits its native tool-call
+// markup instead: <|open|>call tool="name" index="1"<|sep|><|open|>argument key="k" type="string"<|sep|>v
+// <|close|>argument<|sep|>...<|close|>call<|sep|>. It has also imitated a Claude transcript tag it saw in
+// replayed history: <assistant_tool_call name="x" call_id="...">{json}</assistant_tool_call>. Both are
+// unambiguous, so they are converted to the {text, tool_calls} shape; the normal validation still runs.
+// Leaked reasoning before <|close|>think<|sep|> is dropped. Returns undefined when neither form is present.
+export function parseNativeToolMarkup(text: string): JsonRecord | undefined {
+  let s = text;
+  const thinkEnd = '<|close|>think<|sep|>', think = s.lastIndexOf(thinkEnd);
+  if (think >= 0) s = s.slice(think + thinkEnd.length);
+  const calls: JsonRecord[] = [];
+  const coerce = (type: string | undefined, raw: string): unknown => {
+    if (type === 'number') { const n = Number(raw.trim()); return Number.isFinite(n) ? n : raw; }
+    if (type === 'boolean') return raw.trim() === 'true';
+    if (type === 'object' || type === 'array') { try { return parseJsonLoosely(raw); } catch { return raw; } }
+    return raw;
+  };
+  for (const call of s.matchAll(/<\|open\|>call tool="([^"]+)"[^<]*<\|sep\|>([\s\S]*?)<\|close\|>call<\|sep\|>/g)) {
+    const args: JsonRecord = {};
+    for (const arg of call[2]!.matchAll(/<\|open\|>argument key="([^"]+)"(?: type="([^"]*)")?<\|sep\|>([\s\S]*?)<\|close\|>argument<\|sep\|>/g)) args[arg[1]!] = coerce(arg[2], arg[3]!);
+    calls.push({ name: call[1], arguments: args });
+  }
+  for (const call of s.matchAll(/<assistant_tool_call name="([^"]+)"[^>]*>\s*([\s\S]*?)\s*<\/assistant_tool_call>/g)) {
+    let args: unknown = call[2]; try { args = parseJsonLoosely(call[2]!); } catch { /* keep raw */ }
+    calls.push({ name: call[1], arguments: args });
+  }
+  if (!calls.length) return undefined;
+  const cut = ['<|open|>tools<|sep|>', '<|open|>call ', '<assistant_tool_call', '</assistant>'].map(m => s.indexOf(m)).filter(i => i >= 0);
+  const textPart = (cut.length ? s.slice(0, Math.min(...cut)) : s).trim();
+  return { text: textPart, tool_calls: calls };
+}
+
+// Refused raw output is kept privately (owner-only file in the runtime state) so the exact mistake can
+// be read afterwards instead of guessed from a category. The log never carries the body itself.
+function captureInvalidOutput(dir: string | undefined, category: string, text: string): string | undefined {
+  if (!dir) return undefined;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${category}.txt`);
+    writeFileSync(file, text, { mode: 0o600 });
+    return file;
+  } catch { return undefined; }
+}
+
+// Every refusal names the exact mistake so the one retry can fix it, and logs a category so the
+// failure is diagnosable afterwards. Nothing has executed when this throws, so retrying is safe.
+export function parseCursorOutput(text: string, request: ResponsesRequest, captureDir?: string): ProxyOutput {
+  const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}): never => {
+    const captured = captureInvalidOutput(captureDir, category, text);
+    logSafe('cursor-invalid-output', { category, bytes: text.length, captured: !!captured, ...fields });
+    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true);
+  };
+  const descriptors = toolDescriptors(request.tools ?? []);
+  const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));
+  let candidate = text.trim();
+  let value: unknown = parseNativeToolMarkup(text);
+  if (value) logSafe('cursor-output-native-markup', { bytes: text.length, calls: (value as JsonRecord).tool_calls instanceof Array ? ((value as JsonRecord).tool_calls as unknown[]).length : 0 });
+  else {
+    candidate = extractJsonObject(text);
+    try { value = parseJsonLoosely(candidate); } catch {
+      return refuse('did not return a parseable JSON object (expected exactly {"text": string, "tool_calls": array} with no Markdown fences or surrounding prose)', 'unparseable', { starts_object: candidate.startsWith('{'), ends_object: candidate.endsWith('}') });
+    }
+  }
+  if (!isRecord(value)) return refuse('returned JSON that is not an object; the reply must be one object with text and tool_calls', 'not-object');
+  if (candidate !== text.trim()) logSafe('cursor-output-unwrapped', { bytes: text.length });
+  const extraTop = Object.keys(value).filter(key => !['text', 'tool_calls'].includes(key));
+  if (extraTop.length) logSafe('cursor-output-extra-keys', { count: extraTop.length });
+  let responseText = value.text;
+  if (responseText === undefined || responseText === null) responseText = '';
+  if (typeof responseText !== 'string') return refuse('returned a non-string text field; text must be a string (use "" when there is nothing to say)', 'text-type');
+  let rawCalls = value.tool_calls;
+  if (rawCalls === undefined || rawCalls === null) rawCalls = [];
+  if (!Array.isArray(rawCalls)) return refuse('returned tool_calls that is not an array; use [] when no tool is needed', 'tool-calls-type');
+  if (rawCalls.length > 64) return refuse('returned more than 64 tool calls in one reply', 'too-many-calls', { count: rawCalls.length });
+  const toolCalls = rawCalls.map((call: unknown, index: number) => {
+    if (!isRecord(call)) return refuse(`tool_calls[${index}] is not an object; each call is {"name": string, "arguments": ...}`, 'call-not-object');
+    // OpenAI-style {type:'function', function:{name, arguments}} is a common slip; unwrap it.
+    const inner = isRecord(call.function) ? call.function : call;
+    let name = typeof inner.name === 'string' ? inner.name : undefined;
+    if (!name) return refuse(`tool_calls[${index}] has no string name; use an exact tool name from the list`, 'call-no-name');
+    if (!allowed.has(name) && name.startsWith('functions.') && allowed.has(name.slice(10))) name = name.slice(10);
+    const descriptor = allowed.get(name);
+    if (!descriptor) {
+      const sample = descriptors.slice(0, 6).map(tool => tool.proxyName).join(', ');
+      return refuse(`called unknown tool ${fieldName(name)}; use an exact tool name from the list (for example ${sample})`, 'unknown-tool');
+    }
+    const rawArgs = inner.arguments ?? inner.input ?? inner.parameters;
+    if (descriptor.type === 'custom') {
+      if (typeof rawArgs !== 'string') return refuse(`passed non-string arguments to custom tool ${descriptor.proxyName}; its arguments must be one raw string, not a JSON object`, 'custom-args-type', { tool: descriptor.proxyName });
+      return { name: descriptor.proxyName, arguments: rawArgs, callId: randomId('call') };
+    }
+    let args: unknown = rawArgs;
+    if (args === undefined || args === null || args === '') args = {};
+    if (typeof args === 'string') { try { args = parseJsonLoosely(args); } catch { return refuse(`passed arguments to ${descriptor.proxyName} that are not valid JSON; function arguments must be a JSON object`, 'args-unparseable', { tool: descriptor.proxyName }); } }
+    if (!isRecord(args)) return refuse(`passed non-object arguments to ${descriptor.proxyName}; function arguments must be a JSON object`, 'args-not-object', { tool: descriptor.proxyName });
+    const contract = isRecord(descriptor.contract) ? descriptor.contract : undefined;
+    const properties = contract && isRecord(contract.properties) ? contract.properties : undefined;
+    if (contract && properties) {
+      const declared = Object.keys(properties);
+      const missing = (Array.isArray(contract.required) ? contract.required : []).filter((key: unknown) => typeof key === 'string' && !Object.hasOwn(args as JsonRecord, key));
+      if (missing.length) return refuse(`called ${descriptor.proxyName} without its required ${missing.map(fieldName).join(', ')}; its parameters are ${declared.join(', ')}`, 'args-missing-required', { tool: descriptor.proxyName, missing: missing.length });
+      // Extra fields carry no meaning for the tool (models like adding description or timeout); drop
+      // them instead of failing the turn, matching the Grok backend.
+      if (contract.additionalProperties === false) {
+        const unexpected = Object.keys(args).filter(key => !declared.includes(key));
+        if (unexpected.length) { logSafe('cursor-argument-shape', { tool: descriptor.proxyName, dropped: unexpected.length }); for (const key of unexpected) delete (args as JsonRecord)[key]; }
+      }
+    }
+    if (!matchesSchema(args, descriptor.contract)) {
+      const declared = properties ? Object.keys(properties).join(', ') : 'as documented';
+      return refuse(`called ${descriptor.proxyName} with arguments that do not match its schema (wrong value type or enum); its parameters are ${declared}`, 'args-schema', { tool: descriptor.proxyName });
+    }
     return { name: descriptor.proxyName, arguments: JSON.stringify(args), callId: randomId('call') };
   });
   const inputTokens = estimateVisibleTokens(requestToPrompt(request));
   const outputTokens = estimateVisibleTokens(text);
-  return { text: value.text, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+  return { text: responseText, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
 }
 
 function assertTextInput(value: unknown): void {
@@ -157,7 +326,7 @@ export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEm
   try { return await value; } catch(error) { if(profileCache.get(cacheKey)===entry) profileCache.delete(cacheKey); throw error; }
 }
 
-export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRequest, selection: JsonRecord): ProxyOutput {
+export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRequest, selection: JsonRecord, captureDir?: string): ProxyOutput {
   // Treat native tools/subagent/compaction as hard failures even with tools: [] configured.
   for (const event of events) {
     const sdk = isRecord(event.sdkMessage) ? event.sdkMessage : undefined;
@@ -173,7 +342,7 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   if (!result || result.status !== FINISHED || !run || run.status !== FINISHED || !isRecord(done) || done.runId !== result.runId || typeof run.result !== 'string') throw new CursorError('Cursor did not finish successfully; no automatic supplier fallback');
   const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
   if (!sameModel) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
-  const output = parseCursorOutput(run.result, request);
+  const output = parseCursorOutput(run.result, request, captureDir);
   if (isRecord(run.usage)) {
     const input = Number(run.usage.inputTokens ?? 0) + Number(run.usage.cacheReadTokens ?? 0) + Number(run.usage.cacheWriteTokens ?? 0), out = Number(run.usage.outputTokens ?? 0);
     if ([input,out].every(n => Number.isSafeInteger(n) && n >= 0)) output.usage = { inputTokens: input, outputTokens: out, totalTokens: input + out };
@@ -265,7 +434,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
     }
     signal?.throwIfAborted(); controller.signal.throwIfAborted();
-    return interpretCursorEvents(events, request, selection);
+    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'));
   } catch (error) {
     // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
     // shows the real cause instead of the generic internal-router message.
