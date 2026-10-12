@@ -258,12 +258,35 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   return { text: responseText, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
 }
 
-function assertTextInput(value: unknown): void {
-  if (Array.isArray(value)) value.forEach(assertTextInput);
-  else if (isRecord(value)) {
-    if (['input_image', 'image', 'input_audio', 'audio', 'input_file', 'file', 'compaction', 'compaction_summary', 'context_compaction', 'encrypted_content'].includes(String(value.type)) || value.file_id || value.encrypted_content) throw new CursorError('Cursor bridge requires restored text history; this attachment or encrypted history is unsupported');
-    Object.values(value).forEach(assertTextInput);
+const OPAQUE_ITEM_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction', 'encrypted_content', 'reasoning']);
+const MEDIA_PART_TYPES = new Set(['input_image', 'image', 'input_audio', 'audio', 'input_file', 'file']);
+const isOpaque = (value: JsonRecord): boolean => OPAQUE_ITEM_TYPES.has(String(value.type)) || typeof value.encrypted_content === 'string';
+const isMedia = (value: JsonRecord): boolean => MEDIA_PART_TYPES.has(String(value.type)) || Boolean(value.file_id) || Boolean(value.image_url) || Boolean(value.audio_url) || Boolean(value.file_data);
+
+/**
+ * Cursor cannot replay OpenAI-encrypted reasoning, compaction summaries or binary attachments. Rather than
+ * refusing the whole turn (which breaks mid-thread model switches from a GPT backend), drop the opaque
+ * history items and replace media parts with a short text placeholder so the model knows something was
+ * omitted. Returns the sanitized input plus a count of what changed for logging.
+ */
+export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: number; replaced: number } {
+  const stats = { dropped: 0, replaced: 0 };
+  const walk = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(walk);
+    if (!isRecord(value)) return value;
+    if (isMedia(value)) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge is text-only]' }; }
+    if (isOpaque(value)) { stats.replaced++; return { type: 'input_text', text: '[encrypted or compacted content from a previous model; unreadable here]' }; }
+    const out: JsonRecord = {};
+    for (const [key, child] of Object.entries(value)) out[key] = walk(child);
+    return out;
+  };
+  if (!Array.isArray(input)) return { input: walk(input), ...stats };
+  const items: unknown[] = [];
+  for (const item of input) {
+    if (isRecord(item) && isOpaque(item)) { stats.dropped++; continue; }
+    items.push(walk(item));
   }
+  return { input: items, ...stats };
 }
 
 const OUTPUT_RULES = `You are inside the Codex external tool loop. Return ONLY one JSON object with exactly text (string) and tool_calls (array). Each call has exactly name and arguments. Use the exact Codex tool names below. Function arguments are JSON objects; custom tool arguments are raw strings. All actions are executed externally by Codex AFTER your reply: you have no native tools. Never claim an action succeeded until its tool result appears in history. Do not wrap JSON in Markdown or add text outside it.`;
@@ -351,7 +374,10 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
 }
 
 async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, signal?: AbortSignal, retryNote = ''): Promise<ProxyOutput> {
-  signal?.throwIfAborted(); assertTextInput(request.input);
+  signal?.throwIfAborted();
+  const sanitized = sanitizeCursorInput(request.input);
+  if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
+  request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
   const selection = cursorSelection(request.model, request.reasoning?.effort, options.fastest);
   const prepared = preparePrompt(request);
   if (prepared.images.length) throw new CursorError('Cursor bridge supports text only');

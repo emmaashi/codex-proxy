@@ -1,5 +1,27 @@
 import { describe, expect, test } from 'bun:test';
-import { connectFrames, cursorEnvironment, cursorSelection, interpretCursorEvents, parseCursorOutput, assertCursorIdentity, verifyCursorProfile, CursorError } from '../src/backends/cursor';
+import { connectFrames, cursorEnvironment, cursorSelection, interpretCursorEvents, parseCursorOutput, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
+
+test('Cursor sanitizer drops encrypted reasoning and compaction items and replaces media parts instead of refusing the turn',()=>{
+ type R=Record<string,unknown>;
+ const history=[
+  {type:'message',role:'user',content:[{type:'input_text',text:'look at this'},{type:'input_image',image_url:'data:image/png;base64,AAAA'}]},
+  {type:'reasoning',id:'rs_1',encrypted_content:'gAAAAopaque',summary:[]},
+  {type:'message',role:'assistant',content:[{type:'output_text',text:'ok'}]},
+  {type:'compaction',encrypted_content:'gAAAAsummary'},
+  {type:'function_call_output',call_id:'c1',output:[{type:'input_file',file_id:'f_1'},{type:'input_text',text:'done'}]},
+  {type:'message',role:'user',content:'plain string survives'},
+ ];
+ const result=sanitizeCursorInput(history);
+ expect(result.dropped).toBe(2);
+ expect(result.replaced).toBe(2);
+ const items=result.input as R[];
+ expect(items.map(i=>i.type)).toEqual(['message','message','function_call_output','message']);
+ expect((items[0]!.content as R[])[1]).toEqual({type:'input_text',text:'[attachment omitted: the Cursor bridge is text-only]'});
+ expect((items[2]!.output as R[])[1]).toEqual({type:'input_text',text:'done'});
+ expect(JSON.stringify(result.input)).not.toContain('gAAAA');
+ expect(history[1]!.encrypted_content).toBe('gAAAAopaque');
+ expect(sanitizeCursorInput('just text')).toEqual({input:'just text',dropped:0,replaced:0});
+});
 import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { BackendError, type SubscriptionBackend } from '../src/backends/contract';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
