@@ -7,6 +7,7 @@ import { resolve, join, isAbsolute } from 'node:path';
 // turn only has to send the tool results.
 import { positiveInt } from '../env';
 import { isRecord, randomId } from '../json';
+import { logSafe } from '../log';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { reconnectTransport, transportError } from '../transport';
@@ -114,6 +115,8 @@ export class ClaudeAccount {
     if (exitCode !== 0 || !info?.loggedIn ||
       (this.options.expectedEmail && info.email !== this.options.expectedEmail) ||
       (this.options.expectedOrg && info.orgId !== this.options.expectedOrg)) {
+      // Content-free diagnostics: which condition failed, never the identity values themselves.
+      logSafe('claude-identity-mismatch', { exit: exitCode, logged_in: !!info?.loggedIn, email_match: !this.options.expectedEmail || info?.email === this.options.expectedEmail, org_match: !this.options.expectedOrg || info?.orgId === this.options.expectedOrg, aborted: !!signal?.aborted });
       throw new BackendError('Claude account identity does not match its configured login');
     }
   }
