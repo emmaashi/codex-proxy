@@ -50,7 +50,7 @@ for(const invalid of [
  {text:'',tool_calls:[{name:'shell',arguments:{}}]},
  {text:'',tool_calls:[{name:'functions.read',arguments:{path:1}}]},
  {text:'',tool_calls:[{name:'functions.read',arguments:{}}]},
- {text:'',tool_calls:[{name:'apply_patch',arguments:{patch:'x'}}]},
+ {text:'',tool_calls:[{name:'apply_patch',arguments:{patch:1,other:true}}]},
 ])test('Cursor refuses malformed or unavailable action '+JSON.stringify(invalid),()=>{expect(()=>output(invalid)).toThrow(CursorError)});
 test('Cursor lenient parser tolerates fences, extra keys, extra args and OpenAI-style calls',()=>{
  const fenced='Here is my answer:\n```json\n{"text":"hi","tool_calls":[{"name":"functions.read","arguments":"{\\"path\\":\\"a\\"}"}]}\n```';
