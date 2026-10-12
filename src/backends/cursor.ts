@@ -201,7 +201,8 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       cancellation = fetch(`${url}/sdk.v1.SdkAgentService/CancelRun`, { method:'POST', signal:AbortSignal.timeout(2000), headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify({agentId,runId}) }).then(() => {}, () => {}).finally(() => {proc?.kill();});
     } else proc?.kill();
   };
-  const timeout = setTimeout(cancel, positiveInt('CURSOR_TIMEOUT_MS', 900_000));
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; cancel(); }, positiveInt('CURSOR_TIMEOUT_MS', 900_000));
   signal?.addEventListener('abort', cancel, { once: true });
   try {
     signal?.throwIfAborted();
@@ -265,6 +266,11 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     }
     signal?.throwIfAborted(); controller.signal.throwIfAborted();
     return interpretCursorEvents(events, request, selection);
+  } catch (error) {
+    // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
+    // shows the real cause instead of the generic internal-router message.
+    if (timedOut) throw new CursorError('Cursor request timed out; no automatic supplier fallback');
+    throw error;
   } finally {
     clearTimeout(timeout); clearTimeout(startup); signal?.removeEventListener('abort', cancel);
     if (cancellation) await cancellation;
